@@ -20,6 +20,10 @@ fn complex_pow(a: vec2<f32>, pow: i32) -> vec2<f32>{
     return res;
 }
 
+fn complex_cosh(a: vec2<f32>) -> vec2<f32> {
+    return vec2<f32>(sinh(a.x) * cos(a.y), sinh(a.x) * sin(a.y));
+}
+
 fn lerp(a: f32, b: f32, t: f32) -> f32{
     return a + t * (b - a);
 }
@@ -47,7 +51,7 @@ fn update(@builtin(global_invocation_id) invocation_id: vec3<u32>) {
             textureStore(texture, location, lerp_vec(vec4<f32>(1,0,0,1), vec4<f32>(1,1,1,1), f32(i) / f32(iterations)));
             return;
         }
-        z = complex_pow(z, 4) + c;
+        z = complex_cosh(complex_pow(z, 3)) + c;
     }
     textureStore(texture, location, vec4<f32>(0,0,0,1));
 }
