@@ -4,11 +4,11 @@
 //! is rendered to the screen.
 
 use bevy::{
+    math::DVec2,
     prelude::*,
     render::{
         extract_resource::{ExtractResource, ExtractResourcePlugin},
-        render_asset::RenderAssetUsages,
-        render_asset::RenderAssets,
+        render_asset::{RenderAssetUsages, RenderAssets},
         render_graph::{self, RenderGraph, RenderLabel},
         render_resource::*,
         renderer::{RenderContext, RenderDevice},
@@ -16,6 +16,7 @@ use bevy::{
     },
     window::WindowPlugin,
 };
+use bytemuck::{Pod, Zeroable};
 use std::borrow::Cow;
 
 const WORKGROUP_SIZE: u32 = 8;
@@ -65,7 +66,14 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     });
     commands.spawn(Camera2dBundle::default());
 
-    commands.insert_resource(GameOfLifeImage { texture: image });
+    commands.insert_resource(GameOfLifeImage {
+        texture: image,
+        game_of_life_data: GameOfLifeUniform {
+            view_scale: 2.0,
+            view_pos: DVec2::new(0.0, 0.0),
+            _padding: [0.0],
+        },
+    });
 }
 
 struct GameOfLifeComputePlugin;
@@ -95,14 +103,26 @@ impl Plugin for GameOfLifeComputePlugin {
     }
 }
 
+#[derive(Clone, Copy, Pod, Zeroable)]
+#[repr(C)]
+struct GameOfLifeUniform {
+    view_scale: f64,
+    view_pos: DVec2,
+    _padding: [f64; 1],
+}
+
 #[derive(Resource, Clone, Deref, ExtractResource, AsBindGroup)]
 struct GameOfLifeImage {
     #[storage_texture(0, image_format = Rgba8Unorm, access = ReadWrite)]
     texture: Handle<Image>,
+    #[deref]
+    game_of_life_data: GameOfLifeUniform,
 }
 
 #[derive(Resource)]
-struct GameOfLifeImageBindGroup(BindGroup);
+struct GameOfLifeImageBindGroups {
+    texture_bind_group: BindGroup,
+}
 
 fn prepare_bind_group(
     mut commands: Commands,
@@ -112,12 +132,42 @@ fn prepare_bind_group(
     render_device: Res<RenderDevice>,
 ) {
     let view = gpu_images.get(&game_of_life_image.texture).unwrap();
-    let bind_group = render_device.create_bind_group(
+
+    // Create uniform data
+    let uniform_data = GameOfLifeUniform {
+        view_scale: game_of_life_image.game_of_life_data.view_scale,
+        view_pos: game_of_life_image.game_of_life_data.view_pos,
+        _padding: [0.0],
+    };
+
+    // Create a uniform buffer
+    let uniform_buffer = render_device.create_buffer_with_data(&BufferInitDescriptor {
+        label: Some("Game of Life Uniform Buffer"),
+        contents: bytemuck::cast_slice(&[uniform_data]),
+        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+    });
+
+    // Create the texture bind group
+    let texture_bind_group = render_device.create_bind_group(
         None,
         &pipeline.texture_bind_group_layout,
-        &BindGroupEntries::single(&view.texture_view),
+        &[
+            BindGroupEntry {
+                binding: 0,
+                resource: view.texture_view.into_binding(),
+            },
+            BindGroupEntry {
+                binding: 1,
+                resource: BindingResource::Buffer(BufferBinding {
+                    buffer: &uniform_buffer,
+                    offset: 0,
+                    size: None,
+                }),
+            },
+        ],
     );
-    commands.insert_resource(GameOfLifeImageBindGroup(bind_group));
+
+    commands.insert_resource(GameOfLifeImageBindGroups { texture_bind_group });
 }
 
 #[derive(Resource)]
@@ -127,10 +177,38 @@ struct GameOfLifePipeline {
     update_pipeline: CachedComputePipelineId,
 }
 
+fn create_texture_bind_group_layout(render_device: &RenderDevice) -> BindGroupLayout {
+    let entries = &[
+        BindGroupLayoutEntry {
+            binding: 0,
+            visibility: ShaderStages::COMPUTE,
+            ty: BindingType::StorageTexture {
+                access: StorageTextureAccess::ReadWrite,
+                format: TextureFormat::Rgba8Unorm, // or whatever format you need
+                view_dimension: TextureViewDimension::D2,
+            },
+            count: None,
+        },
+        BindGroupLayoutEntry {
+            binding: 1,
+            visibility: ShaderStages::COMPUTE,
+            ty: BindingType::Buffer {
+                ty: BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        },
+    ];
+
+    render_device.create_bind_group_layout("GameOfLife Texture Bind Group Layout", entries)
+}
+
 impl FromWorld for GameOfLifePipeline {
     fn from_world(world: &mut World) -> Self {
         let render_device = world.resource::<RenderDevice>();
-        let texture_bind_group_layout = GameOfLifeImage::bind_group_layout(render_device);
+        let texture_bind_group_layout = create_texture_bind_group_layout(render_device);
+
         let shader = world.resource::<AssetServer>().load("shaders/mandel.wgsl");
         let pipeline_cache = world.resource::<PipelineCache>();
         let init_pipeline = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
@@ -207,7 +285,7 @@ impl render_graph::Node for GameOfLifeNode {
         render_context: &mut RenderContext,
         world: &World,
     ) -> Result<(), render_graph::NodeRunError> {
-        let texture_bind_group = &world.resource::<GameOfLifeImageBindGroup>().0;
+        let bind_group = &world.resource::<GameOfLifeImageBindGroups>();
         let pipeline_cache = world.resource::<PipelineCache>();
         let pipeline = world.resource::<GameOfLifePipeline>();
 
@@ -215,7 +293,7 @@ impl render_graph::Node for GameOfLifeNode {
             .command_encoder()
             .begin_compute_pass(&ComputePassDescriptor::default());
 
-        pass.set_bind_group(0, texture_bind_group, &[]);
+        pass.set_bind_group(0, &bind_group.texture_bind_group, &[]);
 
         // select the pipeline based on the current state
         match self.state {
