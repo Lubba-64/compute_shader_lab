@@ -7,11 +7,13 @@ use bevy::{
     math::DVec2,
     prelude::*,
     render::{
+        extract_component::{ExtractComponent, ExtractComponentPlugin},
         extract_resource::{ExtractResource, ExtractResourcePlugin},
         render_asset::{RenderAssetUsages, RenderAssets},
         render_graph::{self, RenderGraph, RenderLabel},
         render_resource::*,
         renderer::{RenderContext, RenderDevice},
+        texture::GpuImage,
         Render, RenderApp, RenderSet,
     },
     window::WindowPlugin,
@@ -66,13 +68,14 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     });
     commands.spawn(Camera2dBundle::default());
 
-    commands.insert_resource(GameOfLifeImage {
+    commands.spawn(GameOfLifeImage {
         texture: image,
         game_of_life_data: GameOfLifeUniform {
             view_scale: 2.0,
             view_pos: DVec2::new(0.0, 0.0),
             _padding: [0.0],
         },
+        texture_bind_group: None,
     });
 }
 
@@ -85,14 +88,14 @@ impl Plugin for GameOfLifeComputePlugin {
     fn build(&self, app: &mut App) {
         // Extract the game of life image resource from the main world into the render world
         // for operation on by the compute shader and display on the sprite.
-        app.add_plugins(ExtractResourcePlugin::<GameOfLifeImage>::default());
+        app.add_plugins(ExtractComponentPlugin::<GameOfLifeImage>::default());
         let render_app = app.sub_app_mut(RenderApp);
         render_app.add_systems(
             Render,
             prepare_bind_group.in_set(RenderSet::PrepareBindGroups),
         );
 
-        let mut render_graph = render_app.world.resource_mut::<RenderGraph>();
+        let mut render_graph = render_app.world_mut().resource_mut::<RenderGraph>();
         render_graph.add_node(GameOfLifeLabel, GameOfLifeNode::default());
         render_graph.add_node_edge(GameOfLifeLabel, bevy::render::graph::CameraDriverLabel);
     }
@@ -111,63 +114,60 @@ struct GameOfLifeUniform {
     _padding: [f64; 1],
 }
 
-#[derive(Resource, Clone, Deref, ExtractResource, AsBindGroup)]
+#[derive(ExtractComponent, Clone, Deref, Component, AsBindGroup)]
 struct GameOfLifeImage {
     #[storage_texture(0, image_format = Rgba8Unorm, access = ReadWrite)]
     texture: Handle<Image>,
     #[deref]
     game_of_life_data: GameOfLifeUniform,
-}
-
-#[derive(Resource)]
-struct GameOfLifeImageBindGroups {
-    texture_bind_group: BindGroup,
+    texture_bind_group: Option<BindGroup>,
 }
 
 fn prepare_bind_group(
-    mut commands: Commands,
     pipeline: Res<GameOfLifePipeline>,
-    gpu_images: Res<RenderAssets<Image>>,
-    game_of_life_image: Res<GameOfLifeImage>,
+    gpu_images: Res<RenderAssets<GpuImage>>,
+    mut game_of_life_images: Query<&mut GameOfLifeImage>,
     render_device: Res<RenderDevice>,
 ) {
-    let view = gpu_images.get(&game_of_life_image.texture).unwrap();
+    for mut image in game_of_life_images.iter_mut() {
+        let view = gpu_images.get(&image.texture).unwrap();
 
-    // Create uniform data
-    let uniform_data = GameOfLifeUniform {
-        view_scale: game_of_life_image.game_of_life_data.view_scale,
-        view_pos: game_of_life_image.game_of_life_data.view_pos,
-        _padding: [0.0],
-    };
+        // Create uniform data
+        let uniform_data = GameOfLifeUniform {
+            view_scale: image.game_of_life_data.view_scale,
+            view_pos: image.game_of_life_data.view_pos,
+            _padding: [0.0],
+        };
 
-    // Create a uniform buffer
-    let uniform_buffer = render_device.create_buffer_with_data(&BufferInitDescriptor {
-        label: Some("Game of Life Uniform Buffer"),
-        contents: bytemuck::cast_slice(&[uniform_data]),
-        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-    });
+        // Create a uniform buffer
+        let uniform_buffer = render_device.create_buffer_with_data(&BufferInitDescriptor {
+            label: Some("Game of Life Uniform Buffer"),
+            contents: bytemuck::cast_slice(&[uniform_data]),
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        });
 
-    // Create the texture bind group
-    let texture_bind_group = render_device.create_bind_group(
-        None,
-        &pipeline.texture_bind_group_layout,
-        &[
-            BindGroupEntry {
-                binding: 0,
-                resource: view.texture_view.into_binding(),
-            },
-            BindGroupEntry {
-                binding: 1,
-                resource: BindingResource::Buffer(BufferBinding {
-                    buffer: &uniform_buffer,
-                    offset: 0,
-                    size: None,
-                }),
-            },
-        ],
-    );
+        // Create the texture bind group
+        let texture_bind_group = render_device.create_bind_group(
+            None,
+            &pipeline.texture_bind_group_layout,
+            &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: view.texture_view.into_binding(),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: BindingResource::Buffer(BufferBinding {
+                        buffer: &uniform_buffer,
+                        offset: 0,
+                        size: None,
+                    }),
+                },
+            ],
+        );
 
-    commands.insert_resource(GameOfLifeImageBindGroups { texture_bind_group });
+        image.texture_bind_group = Some(texture_bind_group);
+    }
 }
 
 #[derive(Resource)]
@@ -235,23 +235,18 @@ impl FromWorld for GameOfLifePipeline {
         }
     }
 }
-
+#[derive(Default)]
 enum GameOfLifeState {
+    #[default]
     Loading,
     Init,
     Update,
 }
 
+#[derive(Default)]
 struct GameOfLifeNode {
     state: GameOfLifeState,
-}
-
-impl Default for GameOfLifeNode {
-    fn default() -> Self {
-        Self {
-            state: GameOfLifeState::Loading,
-        }
-    }
+    query: Vec<GameOfLifeImage>,
 }
 
 impl render_graph::Node for GameOfLifeNode {
@@ -275,7 +270,13 @@ impl render_graph::Node for GameOfLifeNode {
                     self.state = GameOfLifeState::Update;
                 }
             }
-            GameOfLifeState::Update => {}
+            GameOfLifeState::Update => {
+                self.query = world
+                    .query::<&GameOfLifeImage>()
+                    .iter(world)
+                    .cloned()
+                    .collect();
+            }
         }
     }
 
@@ -285,35 +286,34 @@ impl render_graph::Node for GameOfLifeNode {
         render_context: &mut RenderContext,
         world: &World,
     ) -> Result<(), render_graph::NodeRunError> {
-        let bind_group = &world.resource::<GameOfLifeImageBindGroups>();
         let pipeline_cache = world.resource::<PipelineCache>();
         let pipeline = world.resource::<GameOfLifePipeline>();
+        for bind in self.query.iter() {
+            let mut pass = render_context
+                .command_encoder()
+                .begin_compute_pass(&ComputePassDescriptor::default());
 
-        let mut pass = render_context
-            .command_encoder()
-            .begin_compute_pass(&ComputePassDescriptor::default());
+            pass.set_bind_group(0, &bind.texture_bind_group.as_ref().unwrap(), &[]);
 
-        pass.set_bind_group(0, &bind_group.texture_bind_group, &[]);
-
-        // select the pipeline based on the current state
-        match self.state {
-            GameOfLifeState::Loading => {}
-            GameOfLifeState::Init => {
-                let init_pipeline = pipeline_cache
-                    .get_compute_pipeline(pipeline.init_pipeline)
-                    .unwrap();
-                pass.set_pipeline(init_pipeline);
-                pass.dispatch_workgroups(SIZE.0 / WORKGROUP_SIZE, SIZE.1 / WORKGROUP_SIZE, 1);
-            }
-            GameOfLifeState::Update => {
-                let update_pipeline = pipeline_cache
-                    .get_compute_pipeline(pipeline.update_pipeline)
-                    .unwrap();
-                pass.set_pipeline(update_pipeline);
-                pass.dispatch_workgroups(SIZE.0 / WORKGROUP_SIZE, SIZE.1 / WORKGROUP_SIZE, 1);
+            // select the pipeline based on the current state
+            match self.state {
+                GameOfLifeState::Loading => {}
+                GameOfLifeState::Init => {
+                    let init_pipeline = pipeline_cache
+                        .get_compute_pipeline(pipeline.init_pipeline)
+                        .unwrap();
+                    pass.set_pipeline(init_pipeline);
+                    pass.dispatch_workgroups(SIZE.0 / WORKGROUP_SIZE, SIZE.1 / WORKGROUP_SIZE, 1);
+                }
+                GameOfLifeState::Update => {
+                    let update_pipeline = pipeline_cache
+                        .get_compute_pipeline(pipeline.update_pipeline)
+                        .unwrap();
+                    pass.set_pipeline(update_pipeline);
+                    pass.dispatch_workgroups(SIZE.0 / WORKGROUP_SIZE, SIZE.1 / WORKGROUP_SIZE, 1);
+                }
             }
         }
-
         Ok(())
     }
 }
