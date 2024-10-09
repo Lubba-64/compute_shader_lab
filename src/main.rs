@@ -4,11 +4,11 @@
 //! is rendered to the screen.
 
 use bevy::{
+    diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin},
     math::DVec2,
     prelude::*,
     render::{
         extract_component::{ExtractComponent, ExtractComponentPlugin},
-        extract_resource::{ExtractResource, ExtractResourcePlugin},
         render_asset::{RenderAssetUsages, RenderAssets},
         render_graph::{self, RenderGraph, RenderLabel},
         render_resource::*,
@@ -18,8 +18,9 @@ use bevy::{
     },
     window::WindowPlugin,
 };
+use bevy_inspector_egui::quick::WorldInspectorPlugin;
 use bytemuck::{Pod, Zeroable};
-use std::borrow::Cow;
+use std::{borrow::Cow, collections::HashMap};
 
 const WORKGROUP_SIZE: u32 = 8;
 const SIZE: (u32, u32) = (1920, 1080);
@@ -38,6 +39,9 @@ fn main() {
             }),
             GameOfLifeComputePlugin,
         ))
+        .add_plugins(LogDiagnosticsPlugin::default())
+        .add_plugins(FrameTimeDiagnosticsPlugin::default())
+        .add_plugins(WorldInspectorPlugin::new())
         .add_systems(Startup, setup)
         .run();
 }
@@ -58,6 +62,21 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
         TextureUsages::COPY_DST | TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING;
     let image = images.add(image);
 
+    let mut image2 = Image::new_fill(
+        Extent3d {
+            width: SIZE.0,
+            height: SIZE.1,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        &[0, 0, 0, 255],
+        TextureFormat::Rgba8Unorm,
+        RenderAssetUsages::RENDER_WORLD,
+    );
+    image2.texture_descriptor.usage =
+        TextureUsages::COPY_DST | TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING;
+    let image2 = images.add(image2);
+
     commands.spawn(SpriteBundle {
         sprite: Sprite {
             custom_size: Some(Vec2::new(SIZE.0 as f32, SIZE.1 as f32)),
@@ -66,16 +85,41 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
         texture: image.clone(),
         ..default()
     });
+
+    commands.spawn(SpriteBundle {
+        sprite: Sprite {
+            custom_size: Some(Vec2::new(SIZE.0 as f32, SIZE.1 as f32)),
+            ..default()
+        },
+        texture: image.clone(),
+        transform: Transform {
+            translation: Vec3 {
+                x: 1000.0,
+                y: 1000.0,
+                z: 0.0,
+            },
+            ..default()
+        },
+        ..default()
+    });
     commands.spawn(Camera2dBundle::default());
 
     commands.spawn(GameOfLifeImage {
         texture: image,
         game_of_life_data: GameOfLifeUniform {
-            view_scale: 2.0,
+            view_scale: 10.0,
             view_pos: DVec2::new(0.0, 0.0),
             _padding: [0.0],
         },
-        texture_bind_group: None,
+    });
+
+    commands.spawn(GameOfLifeImage {
+        texture: image2,
+        game_of_life_data: GameOfLifeUniform {
+            view_scale: 10.0,
+            view_pos: DVec2::new(1.0, 0.0),
+            _padding: [0.0],
+        },
     });
 }
 
@@ -90,19 +134,15 @@ impl Plugin for GameOfLifeComputePlugin {
         // for operation on by the compute shader and display on the sprite.
         app.add_plugins(ExtractComponentPlugin::<GameOfLifeImage>::default());
         let render_app = app.sub_app_mut(RenderApp);
-        render_app.add_systems(
-            Render,
-            prepare_bind_group.in_set(RenderSet::PrepareBindGroups),
-        );
+        render_app
+            .add_systems(
+                Render,
+                prepare_bind_group.in_set(RenderSet::PrepareBindGroups),
+            )
+            .insert_resource(RenderDataResource(HashMap::new()));
 
         let mut render_graph = render_app.world_mut().resource_mut::<RenderGraph>();
         render_graph.add_node(GameOfLifeLabel, GameOfLifeNode::default());
-        render_graph.add_node_edge(GameOfLifeLabel, bevy::render::graph::CameraDriverLabel);
-    }
-
-    fn finish(&self, app: &mut App) {
-        let render_app = app.sub_app_mut(RenderApp);
-        render_app.init_resource::<GameOfLifePipeline>();
     }
 }
 
@@ -114,42 +154,50 @@ struct GameOfLifeUniform {
     _padding: [f64; 1],
 }
 
+#[derive(Clone, Debug)]
+#[repr(C)]
+struct GameOfLifeRenderData {
+    texture_bind_group: BindGroup,
+    init_pipeline: CachedComputePipelineId,
+    update_pipeline: CachedComputePipelineId,
+    state: GameOfLifeState,
+}
+
 #[derive(ExtractComponent, Clone, Deref, Component, AsBindGroup)]
 struct GameOfLifeImage {
     #[storage_texture(0, image_format = Rgba8Unorm, access = ReadWrite)]
     texture: Handle<Image>,
     #[deref]
     game_of_life_data: GameOfLifeUniform,
-    texture_bind_group: Option<BindGroup>,
 }
 
+#[derive(Resource)]
+struct RenderDataResource(HashMap<AssetId<Image>, GameOfLifeRenderData>);
+
 fn prepare_bind_group(
-    pipeline: Res<GameOfLifePipeline>,
     gpu_images: Res<RenderAssets<GpuImage>>,
-    mut game_of_life_images: Query<&mut GameOfLifeImage>,
+    game_of_life_images: Query<&GameOfLifeImage>,
     render_device: Res<RenderDevice>,
+    pipeline_cache: Res<PipelineCache>,
+    asset_server: Res<AssetServer>,
+    mut render_data: ResMut<RenderDataResource>,
 ) {
-    for mut image in game_of_life_images.iter_mut() {
+    for image in game_of_life_images.iter() {
         let view = gpu_images.get(&image.texture).unwrap();
 
-        // Create uniform data
-        let uniform_data = GameOfLifeUniform {
-            view_scale: image.game_of_life_data.view_scale,
-            view_pos: image.game_of_life_data.view_pos,
-            _padding: [0.0],
-        };
+        let texture_bind_group_layout = create_texture_bind_group_layout(render_device.as_ref());
 
         // Create a uniform buffer
         let uniform_buffer = render_device.create_buffer_with_data(&BufferInitDescriptor {
             label: Some("Game of Life Uniform Buffer"),
-            contents: bytemuck::cast_slice(&[uniform_data]),
+            contents: bytemuck::cast_slice(&[image.game_of_life_data]),
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
         });
 
         // Create the texture bind group
         let texture_bind_group = render_device.create_bind_group(
             None,
-            &pipeline.texture_bind_group_layout,
+            &texture_bind_group_layout,
             &[
                 BindGroupEntry {
                     binding: 0,
@@ -166,15 +214,42 @@ fn prepare_bind_group(
             ],
         );
 
-        image.texture_bind_group = Some(texture_bind_group);
-    }
-}
+        let gaming = match &mut render_data.0.get_mut(&image.texture.id()) {
+            Some(x) => {
+                x.texture_bind_group = texture_bind_group;
+                x.clone()
+            }
+            None => {
+                let shader = asset_server.load("shaders/mandel.wgsl");
+                let init_pipeline =
+                    pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+                        label: None,
+                        layout: vec![texture_bind_group_layout.clone()],
+                        push_constant_ranges: Vec::new(),
+                        shader: shader.clone(),
+                        shader_defs: vec![],
+                        entry_point: Cow::from("init"),
+                    });
+                let update_pipeline =
+                    pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+                        label: None,
+                        layout: vec![texture_bind_group_layout.clone()],
+                        push_constant_ranges: Vec::new(),
+                        shader: shader.clone(),
+                        shader_defs: vec![],
+                        entry_point: Cow::from("update"),
+                    });
+                GameOfLifeRenderData {
+                    texture_bind_group,
+                    init_pipeline,
+                    update_pipeline,
+                    state: GameOfLifeState::Loading,
+                }
+            }
+        };
 
-#[derive(Resource)]
-struct GameOfLifePipeline {
-    texture_bind_group_layout: BindGroupLayout,
-    init_pipeline: CachedComputePipelineId,
-    update_pipeline: CachedComputePipelineId,
+        render_data.0.insert(image.texture.id(), gaming);
+    }
 }
 
 fn create_texture_bind_group_layout(render_device: &RenderDevice) -> BindGroupLayout {
@@ -204,38 +279,7 @@ fn create_texture_bind_group_layout(render_device: &RenderDevice) -> BindGroupLa
     render_device.create_bind_group_layout("GameOfLife Texture Bind Group Layout", entries)
 }
 
-impl FromWorld for GameOfLifePipeline {
-    fn from_world(world: &mut World) -> Self {
-        let render_device = world.resource::<RenderDevice>();
-        let texture_bind_group_layout = create_texture_bind_group_layout(render_device);
-
-        let shader = world.resource::<AssetServer>().load("shaders/mandel.wgsl");
-        let pipeline_cache = world.resource::<PipelineCache>();
-        let init_pipeline = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-            label: None,
-            layout: vec![texture_bind_group_layout.clone()],
-            push_constant_ranges: Vec::new(),
-            shader: shader.clone(),
-            shader_defs: vec![],
-            entry_point: Cow::from("init"),
-        });
-        let update_pipeline = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-            label: None,
-            layout: vec![texture_bind_group_layout.clone()],
-            push_constant_ranges: Vec::new(),
-            shader,
-            shader_defs: vec![],
-            entry_point: Cow::from("update"),
-        });
-
-        GameOfLifePipeline {
-            texture_bind_group_layout,
-            init_pipeline,
-            update_pipeline,
-        }
-    }
-}
-#[derive(Default)]
+#[derive(Default, Clone, Debug)]
 enum GameOfLifeState {
     #[default]
     Loading,
@@ -245,39 +289,33 @@ enum GameOfLifeState {
 
 #[derive(Default)]
 struct GameOfLifeNode {
-    state: GameOfLifeState,
-    query: Vec<GameOfLifeImage>,
+    query: HashMap<AssetId<Image>, GameOfLifeRenderData>,
 }
 
 impl render_graph::Node for GameOfLifeNode {
     fn update(&mut self, world: &mut World) {
-        let pipeline = world.resource::<GameOfLifePipeline>();
-        let pipeline_cache = world.resource::<PipelineCache>();
-
-        // if the corresponding pipeline has loaded, transition to the next stage
-        match self.state {
-            GameOfLifeState::Loading => {
-                if let CachedPipelineState::Ok(_) =
-                    pipeline_cache.get_compute_pipeline_state(pipeline.init_pipeline)
-                {
-                    self.state = GameOfLifeState::Init;
+        self.query = world.resource::<RenderDataResource>().0.clone();
+        for (_k, v) in self.query.iter_mut() {
+            let pipeline_cache = world.resource::<PipelineCache>();
+            match v.state.clone() {
+                GameOfLifeState::Loading => {
+                    if let CachedPipelineState::Ok(_) =
+                        pipeline_cache.get_compute_pipeline_state(v.init_pipeline)
+                    {
+                        v.state = GameOfLifeState::Init;
+                    }
                 }
-            }
-            GameOfLifeState::Init => {
-                if let CachedPipelineState::Ok(_) =
-                    pipeline_cache.get_compute_pipeline_state(pipeline.update_pipeline)
-                {
-                    self.state = GameOfLifeState::Update;
+                GameOfLifeState::Init => {
+                    if let CachedPipelineState::Ok(_) =
+                        pipeline_cache.get_compute_pipeline_state(v.update_pipeline)
+                    {
+                        v.state = GameOfLifeState::Update;
+                    }
                 }
-            }
-            GameOfLifeState::Update => {
-                self.query = world
-                    .query::<&GameOfLifeImage>()
-                    .iter(world)
-                    .cloned()
-                    .collect();
+                GameOfLifeState::Update => {}
             }
         }
+        // if the corresponding pipeline has loaded, transition to the next stage
     }
 
     fn run(
@@ -287,27 +325,26 @@ impl render_graph::Node for GameOfLifeNode {
         world: &World,
     ) -> Result<(), render_graph::NodeRunError> {
         let pipeline_cache = world.resource::<PipelineCache>();
-        let pipeline = world.resource::<GameOfLifePipeline>();
-        for bind in self.query.iter() {
+        for (k, bind) in self.query.iter() {
             let mut pass = render_context
                 .command_encoder()
                 .begin_compute_pass(&ComputePassDescriptor::default());
 
-            pass.set_bind_group(0, &bind.texture_bind_group.as_ref().unwrap(), &[]);
-
+            pass.set_bind_group(0, &bind.texture_bind_group, &[]);
+            println!("{:#?} {:#?}", bind.texture_bind_group, k);
             // select the pipeline based on the current state
-            match self.state {
+            match bind.state.clone() {
                 GameOfLifeState::Loading => {}
                 GameOfLifeState::Init => {
                     let init_pipeline = pipeline_cache
-                        .get_compute_pipeline(pipeline.init_pipeline)
+                        .get_compute_pipeline(bind.init_pipeline)
                         .unwrap();
                     pass.set_pipeline(init_pipeline);
                     pass.dispatch_workgroups(SIZE.0 / WORKGROUP_SIZE, SIZE.1 / WORKGROUP_SIZE, 1);
                 }
                 GameOfLifeState::Update => {
                     let update_pipeline = pipeline_cache
-                        .get_compute_pipeline(pipeline.update_pipeline)
+                        .get_compute_pipeline(bind.update_pipeline)
                         .unwrap();
                     pass.set_pipeline(update_pipeline);
                     pass.dispatch_workgroups(SIZE.0 / WORKGROUP_SIZE, SIZE.1 / WORKGROUP_SIZE, 1);
