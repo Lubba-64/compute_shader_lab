@@ -2,7 +2,6 @@
 //!
 //! Compute shaders use the GPU for computing arbitrary information, that may be independent of what
 //! is rendered to the screen.
-
 use bevy::{
     diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin},
     math::DVec2,
@@ -10,9 +9,8 @@ use bevy::{
     render::{
         extract_component::{ExtractComponent, ExtractComponentPlugin},
         render_asset::{RenderAssetUsages, RenderAssets},
-        render_graph::{self, RenderGraph, RenderLabel},
         render_resource::*,
-        renderer::{RenderContext, RenderDevice},
+        renderer::{RenderDevice, RenderQueue},
         texture::GpuImage,
         Render, RenderApp, RenderSet,
     },
@@ -20,6 +18,7 @@ use bevy::{
 };
 use bevy_inspector_egui::quick::WorldInspectorPlugin;
 use bytemuck::{Pod, Zeroable};
+use std::iter::once;
 use std::{borrow::Cow, collections::HashMap};
 
 const WORKGROUP_SIZE: u32 = 8;
@@ -43,6 +42,7 @@ fn main() {
         .add_plugins(FrameTimeDiagnosticsPlugin::default())
         .add_plugins(WorldInspectorPlugin::new())
         .add_systems(Startup, setup)
+        .register_type::<GameOfLifeImage>()
         .run();
 }
 
@@ -116,7 +116,7 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     commands.spawn(GameOfLifeImage {
         texture: image2,
         game_of_life_data: GameOfLifeUniform {
-            view_scale: 10.0,
+            view_scale: 2.0,
             view_pos: DVec2::new(1.0, 0.0),
             _padding: [0.0],
         },
@@ -124,9 +124,6 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
 }
 
 struct GameOfLifeComputePlugin;
-
-#[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
-struct GameOfLifeLabel;
 
 impl Plugin for GameOfLifeComputePlugin {
     fn build(&self, app: &mut App) {
@@ -139,14 +136,12 @@ impl Plugin for GameOfLifeComputePlugin {
                 Render,
                 prepare_bind_group.in_set(RenderSet::PrepareBindGroups),
             )
+            .add_systems(Render, render_the_shit)
             .insert_resource(RenderDataResource(HashMap::new()));
-
-        let mut render_graph = render_app.world_mut().resource_mut::<RenderGraph>();
-        render_graph.add_node(GameOfLifeLabel, GameOfLifeNode::default());
     }
 }
 
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug, Reflect)]
 #[repr(C)]
 struct GameOfLifeUniform {
     view_scale: f64,
@@ -163,7 +158,7 @@ struct GameOfLifeRenderData {
     state: GameOfLifeState,
 }
 
-#[derive(ExtractComponent, Clone, Deref, Component, AsBindGroup)]
+#[derive(ExtractComponent, Clone, Deref, Component, AsBindGroup, Reflect)]
 struct GameOfLifeImage {
     #[storage_texture(0, image_format = Rgba8Unorm, access = ReadWrite)]
     texture: Handle<Image>,
@@ -189,11 +184,10 @@ fn prepare_bind_group(
 
         // Create a uniform buffer
         let uniform_buffer = render_device.create_buffer_with_data(&BufferInitDescriptor {
-            label: Some("Game of Life Uniform Buffer"),
+            label: None,
             contents: bytemuck::cast_slice(&[image.game_of_life_data]),
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
         });
-
         // Create the texture bind group
         let texture_bind_group = render_device.create_bind_group(
             None,
@@ -221,6 +215,7 @@ fn prepare_bind_group(
             }
             None => {
                 let shader = asset_server.load("shaders/mandel.wgsl");
+
                 let init_pipeline =
                     pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
                         label: None,
@@ -287,51 +282,39 @@ enum GameOfLifeState {
     Update,
 }
 
-#[derive(Default)]
-struct GameOfLifeNode {
-    query: HashMap<AssetId<Image>, GameOfLifeRenderData>,
-}
-
-impl render_graph::Node for GameOfLifeNode {
-    fn update(&mut self, world: &mut World) {
-        self.query = world.resource::<RenderDataResource>().0.clone();
-        for (_k, v) in self.query.iter_mut() {
-            let pipeline_cache = world.resource::<PipelineCache>();
-            match v.state.clone() {
-                GameOfLifeState::Loading => {
-                    if let CachedPipelineState::Ok(_) =
-                        pipeline_cache.get_compute_pipeline_state(v.init_pipeline)
-                    {
-                        v.state = GameOfLifeState::Init;
-                    }
+fn render_the_shit(world: &mut World) {
+    let mut query = world.resource::<RenderDataResource>().0.clone();
+    for (_k, v) in query.iter_mut() {
+        let pipeline_cache = world.resource::<PipelineCache>();
+        match v.state.clone() {
+            GameOfLifeState::Loading => {
+                if let CachedPipelineState::Ok(_) =
+                    pipeline_cache.get_compute_pipeline_state(v.init_pipeline)
+                {
+                    v.state = GameOfLifeState::Init;
                 }
-                GameOfLifeState::Init => {
-                    if let CachedPipelineState::Ok(_) =
-                        pipeline_cache.get_compute_pipeline_state(v.update_pipeline)
-                    {
-                        v.state = GameOfLifeState::Update;
-                    }
-                }
-                GameOfLifeState::Update => {}
             }
+            GameOfLifeState::Init => {
+                if let CachedPipelineState::Ok(_) =
+                    pipeline_cache.get_compute_pipeline_state(v.update_pipeline)
+                {
+                    v.state = GameOfLifeState::Update;
+                }
+            }
+            GameOfLifeState::Update => {}
         }
-        // if the corresponding pipeline has loaded, transition to the next stage
     }
 
-    fn run(
-        &self,
-        _graph: &mut render_graph::RenderGraphContext,
-        render_context: &mut RenderContext,
-        world: &World,
-    ) -> Result<(), render_graph::NodeRunError> {
-        let pipeline_cache = world.resource::<PipelineCache>();
-        for (k, bind) in self.query.iter() {
-            let mut pass = render_context
-                .command_encoder()
-                .begin_compute_pass(&ComputePassDescriptor::default());
+    let pipeline_cache = world.resource::<PipelineCache>();
+    let render_queue = world.resource::<RenderQueue>();
+    let render_device = world.resource::<RenderDevice>();
 
+    for (k, bind) in query.iter() {
+        let mut command_encoder =
+            render_device.create_command_encoder(&CommandEncoderDescriptor { label: None });
+        {
+            let mut pass = command_encoder.begin_compute_pass(&ComputePassDescriptor::default());
             pass.set_bind_group(0, &bind.texture_bind_group, &[]);
-            println!("{:#?} {:#?}", bind.texture_bind_group, k);
             // select the pipeline based on the current state
             match bind.state.clone() {
                 GameOfLifeState::Loading => {}
@@ -340,6 +323,7 @@ impl render_graph::Node for GameOfLifeNode {
                         .get_compute_pipeline(bind.init_pipeline)
                         .unwrap();
                     pass.set_pipeline(init_pipeline);
+
                     pass.dispatch_workgroups(SIZE.0 / WORKGROUP_SIZE, SIZE.1 / WORKGROUP_SIZE, 1);
                 }
                 GameOfLifeState::Update => {
@@ -351,6 +335,8 @@ impl render_graph::Node for GameOfLifeNode {
                 }
             }
         }
-        Ok(())
+        render_queue.submit(once(command_encoder.finish()));
+        render_device.poll(wgpu::MaintainBase::Wait);
     }
+    // if the corresponding pipeline has loaded, transition to the next stage
 }

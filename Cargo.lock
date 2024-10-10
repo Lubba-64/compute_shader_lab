@@ -1489,6 +1489,7 @@ dependencies = [
  "bevy",
  "bevy-inspector-egui",
  "bytemuck",
+ "wgpu",
 ]
 
 [[package]]
